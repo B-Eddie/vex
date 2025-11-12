@@ -43,6 +43,34 @@ PATH_STRIDE = 5
 # The order corresponds to the blocks in the file (each begins with '#PATH-POINTS-START Path').
 START_PATH_INDEX = 0
 
+# --- Odometry (tracking wheels + rotation sensors) configuration ---
+# Toggle odometry-based autonomous (True) or keep existing time-based follower (False).
+USE_ODOMETRY = True
+
+# Rotation sensor ports for tracking pods (adjust to your wiring)
+ODOM_LEFT_PORT = Ports.PORT5
+ODOM_RIGHT_PORT = Ports.PORT6
+ODOM_CENTER_PORT = Ports.PORT7
+
+# If a sensor is mounted reversed, flip here
+ODOM_LEFT_REVERSED = False
+ODOM_RIGHT_REVERSED = True
+ODOM_CENTER_REVERSED = False
+
+# Physical constants (inches)
+# Tracking wheel diameter (2.75" is common for VEX odom wheels)
+ODOM_WHEEL_DIAM_IN = 2.75
+# Distance between left and right tracking wheels (center-to-center)
+ODOM_TRACK_WIDTH_IN = 10.5
+# Lateral wheel offset from the robot rotation center along the forward axis (positive forward)
+ODOM_CENTER_OFFSET_IN = 0.0
+
+# Simple proportional gains for the odometry follower
+ODOM_LIN_GAIN = 8.0   # pct per inch (capped by DRIVE_SPEED_PCT)
+ODOM_TURN_GAIN_DEG = 0.8  # pct per degree (capped by TURN_SPEED_PCT)
+ODOM_DIST_TOL_IN = 0.75
+ODOM_HEAD_TOL_DEG = 5.0
+
 # --- Robot configuration (update ports if your wiring is different) ---
 # Left and right drive motors (flip the 'reverse' boolean if a motor spins
 # the wrong direction when commanded forward)
@@ -57,6 +85,128 @@ lift = Motor(Ports.PORT4, GearSetting.RATIO_18_1, False)
 
 # Controller
 controller = Controller(PRIMARY)
+
+# Rotation sensors for odometry tracking wheels
+left_track = Rotation(ODOM_LEFT_PORT, ODOM_LEFT_REVERSED)
+right_track = Rotation(ODOM_RIGHT_PORT, ODOM_RIGHT_REVERSED)
+center_track = Rotation(ODOM_CENTER_PORT, ODOM_CENTER_REVERSED)
+
+
+# --- Odometry implementation ---
+class Odometry:
+	def __init__(self,
+				 left: Rotation,
+				 right: Rotation,
+				 center: Rotation,
+				 wheel_diam_in: float,
+				 track_width_in: float,
+				 center_offset_in: float) -> None:
+		self.left = left
+		self.right = right
+		self.center = center
+		self.wheel_circ_in = math.pi * float(wheel_diam_in)
+		self.track_width_in = float(track_width_in)
+		self.center_offset_in = float(center_offset_in)
+
+		self.x = 0.0
+		self.y = 0.0
+		self.theta = 0.0  # radians
+
+		self._prev_deg_l = 0.0
+		self._prev_deg_r = 0.0
+		self._prev_deg_c = 0.0
+
+	def reset(self, x_in: float = 0.0, y_in: float = 0.0, theta_deg: float = 0.0) -> None:
+		"""Zero sensors and set pose (x,y in inches, heading in degrees)."""
+		try:
+			self.left.reset_position()
+			self.right.reset_position()
+			self.center.reset_position()
+		except Exception:
+			# Older firmware: fall back to set_position
+			try:
+				self.left.set_position(0, DEGREES)
+				self.right.set_position(0, DEGREES)
+				self.center.set_position(0, DEGREES)
+			except Exception:
+				pass
+
+		self._prev_deg_l = 0.0
+		self._prev_deg_r = 0.0
+		self._prev_deg_c = 0.0
+		self.x = float(x_in)
+		self.y = float(y_in)
+		self.theta = math.radians(float(theta_deg))
+
+	def _deg_to_inches(self, deg: float) -> float:
+		return (deg / 360.0) * self.wheel_circ_in
+
+	def update(self) -> None:
+		"""Integrate one odometry step from rotation deltas."""
+		try:
+			deg_l = self.left.position(DEGREES)
+			deg_r = self.right.position(DEGREES)
+			deg_c = self.center.position(DEGREES)
+		except Exception:
+			# If sensor read fails, skip this update
+			return
+
+		ddeg_l = deg_l - self._prev_deg_l
+		ddeg_r = deg_r - self._prev_deg_r
+		ddeg_c = deg_c - self._prev_deg_c
+
+		# Update prevs early to avoid double counting on reentry
+		self._prev_deg_l = deg_l
+		self._prev_deg_r = deg_r
+		self._prev_deg_c = deg_c
+
+		dl = self._deg_to_inches(ddeg_l)
+		dr = self._deg_to_inches(ddeg_r)
+		dc = self._deg_to_inches(ddeg_c)
+
+		# Differential drive heading change
+		dtheta = (dr - dl) / self.track_width_in  # radians if we treat distances as arc lengths over width
+
+		# Forward and lateral local displacements
+		df = 0.5 * (dl + dr)
+		ds = dc - (self.center_offset_in * dtheta)
+
+		half = 0.5 * dtheta
+		s = math.sin(self.theta + half)
+		c = math.cos(self.theta + half)
+
+		dx = df * c - ds * s
+		dy = df * s + ds * c
+
+		self.x += dx
+		self.y += dy
+		self.theta += dtheta
+
+	def pose(self):
+		return (self.x, self.y, math.degrees(self.theta))
+
+
+_odom = Odometry(left_track, right_track, center_track,
+				 ODOM_WHEEL_DIAM_IN, ODOM_TRACK_WIDTH_IN, ODOM_CENTER_OFFSET_IN)
+_odom_thread_started = False
+
+
+def start_odometry_thread() -> None:
+	global _odom_thread_started
+	if _odom_thread_started:
+		return
+
+	def _task():
+		while True:
+			_odom.update()
+			wait(10, MSEC)
+
+	try:
+		Thread(_task)
+		_odom_thread_started = True
+	except Exception:
+		# If threads aren't available in this environment, we can call update() synchronously
+		_odom_thread_started = False
 
 
 # --- Helper drive / actuator functions (time-based) ---
@@ -237,11 +387,91 @@ def follow_path_time_based(points: list,
 	operate_intake(False)
 
 
+def follow_path_odometry(points: list,
+						 drive_pct: int = DRIVE_SPEED_PCT,
+						 turn_pct: int = TURN_SPEED_PCT,
+						 dist_tol_in: float = ODOM_DIST_TOL_IN,
+						 head_tol_deg: float = ODOM_HEAD_TOL_DEG,
+						 max_ms: int | None = None) -> None:
+	"""Follow waypoints using live odometry pose; simple P control for translation & heading.
+
+	This assumes _odom is running. It will drive to each waypoint in order, applying proportional
+	speeds based on remaining distance and heading error. When within distance AND heading tolerance,
+	it advances to the next point.
+	"""
+	if not points or len(points) < 2:
+		return
+
+	# Transform path into robot-local frame so that start is (0,0,0)
+	x0, y0 = points[0]
+	x1, y1 = points[1]
+	a0 = math.atan2(y1 - y0, x1 - x0)
+	ca = math.cos(-a0)
+	sa = math.sin(-a0)
+	local_pts = []
+	for (px, py) in points:
+		dx0 = px - x0
+		dy0 = py - y0
+		ux = dx0 * ca - dy0 * sa
+		uy = dx0 * sa + dy0 * ca
+		local_pts.append((ux, uy))
+
+	# Intake start (optional piece collection at beginning)
+	operate_intake(True, max(60, drive_pct))
+
+	start_t = Timer()
+	idx = 0
+	while idx < len(local_pts):
+		if max_ms is not None and start_t.time(MSEC) >= max_ms:
+			break
+
+		# Current pose
+		x, y, heading_deg = _odom.pose()
+		tx, ty = local_pts[idx]
+		dx = tx - x
+		dy = ty - y
+		dist = math.hypot(dx, dy)
+		target_heading_deg = math.degrees(math.atan2(dy, dx)) if dist > 0.01 else heading_deg
+		head_err = _normalize_angle_deg(target_heading_deg - heading_deg)
+
+		if dist <= dist_tol_in and abs(head_err) <= head_tol_deg:
+			idx += 1
+			continue
+
+		# Proportional controls
+		lin_cmd = dist * ODOM_LIN_GAIN  # pct
+		turn_cmd = head_err * ODOM_TURN_GAIN_DEG  # pct
+
+		# Cap commands
+		lin_cmd = _cap(lin_cmd, -drive_pct, drive_pct)
+		turn_cmd = _cap(turn_cmd, -turn_pct, turn_pct)
+
+		# Convert to left/right motor velocities
+		left_cmd = _cap(lin_cmd + turn_cmd)
+		right_cmd = _cap(lin_cmd - turn_cmd)
+
+		left_motor.set_velocity(left_cmd, PERCENT)
+		right_motor.set_velocity(right_cmd, PERCENT)
+		left_motor.spin(FORWARD)
+		right_motor.spin(FORWARD)
+
+		wait(20, MSEC)
+
+	operate_intake(False)
+
+
 # --- Autonomous routine (time-based example) ---
 def autonomous() -> None:
 	brain.screen.clear_screen()
 	brain.screen.set_cursor(1, 1)
 	brain.screen.print("Auton: Push Back (paths)")
+
+	if USE_ODOMETRY:
+		# Initialize and start odometry thread
+		_odom.reset(0.0, 0.0, 0.0)
+		start_odometry_thread()
+		brain.screen.new_line()
+		brain.screen.print("Odometry ON")
 
 	# Load all four routes from path.txt
 	paths = load_all_paths_from_file()
@@ -268,11 +498,19 @@ def autonomous() -> None:
 	route = paths[START_PATH_INDEX]
 	brain.screen.new_line()
 	brain.screen.print("Route index: {}".format(START_PATH_INDEX))
-	follow_path_time_based(route,
-						   PATH_STRIDE,
-						   DRIVE_SPEED_PCT,
-						   TURN_SPEED_PCT,
-						   max_ms=AUTON_DURATION_MS - 1000)  # leave buffer
+	if USE_ODOMETRY:
+		follow_path_odometry(route,
+						  DRIVE_SPEED_PCT,
+						  TURN_SPEED_PCT,
+						  ODOM_DIST_TOL_IN,
+						  ODOM_HEAD_TOL_DEG,
+						  max_ms=AUTON_DURATION_MS - 1000)
+	else:
+		follow_path_time_based(route,
+					   PATH_STRIDE,
+					   DRIVE_SPEED_PCT,
+					   TURN_SPEED_PCT,
+					   max_ms=AUTON_DURATION_MS - 1000)  # leave buffer
 	brain.screen.new_line()
 	brain.screen.print("Auton complete")
 
