@@ -8,7 +8,7 @@
 # ---------------------------------------------------------------------------- #
 
 # Library imports
-from vex import *
+from vex import Brain, Ports, Motor, GearSetting, Controller, PRIMARY, Rotation, DEGREES, MSEC, SEC, wait, Thread, FORWARD, REVERSE, PERCENT, BRAKE, COAST, Timer, Competition
 import math
 import os
 
@@ -564,9 +564,9 @@ def driver_control() -> None:
 
 		# Intake controls
 		if controller.buttonR1.pressing():
-			intake.spin(FORWARD, 100, PERCENT)
+			intake.spin(REVERSE, 100, PERCENT)  # Outtake
 		elif controller.buttonR2.pressing():
-			intake.spin(REVERSE, 100, PERCENT)
+			intake.spin(FORWARD, 100, PERCENT)  # Intake
 		else:
 			intake.stop(COAST)
 
@@ -599,27 +599,71 @@ if __name__ == "__main__":
 	# driver_control()
 
 
-	# Standalone chooser for quick testing without field control.
-	# Press Controller A for Autonomous, B for Driver.
-	# brain.screen.clear_screen()
-	# brain.screen.set_cursor(1, 1)
-	# brain.screen.print("Select mode:")
-	# brain.screen.new_line()
-	# brain.screen.print("A=Auton  B=Driver")
+	# Program selector for standalone testing and pre-auton selection
+	# This lets teams choose which preset route to run and whether to use odometry
+	# before starting autonomous (or to run driver control manually).
+	def program_selector(timeout_s: float = 15.0):
+		global START_PATH_INDEX
 
-	# selection = None
-	# start_t = Timer()
-	# while selection is None and start_t.time(MSEC) < 10_000:  # wait up to 10s
-	# 	if controller.buttonA.pressing():
-	# 		selection = "auton"
-	# 	elif controller.buttonB.pressing():
-	# 		selection = "driver"
-	# 	wait(20, MSEC)
+		# load information
+		paths = load_all_paths_from_file()
+		routes_count = len(paths)
 
-	# if selection == "auton":
-	# 	autonomous()
-	# else:
-	# 	# default to driver if none selected
-	# 	driver_control()
+		start_t = Timer()
+		brain.screen.clear_screen()
+		brain.screen.set_cursor(1, 1)
+		brain.screen.print("Program Selector")
+		while True:
+			# Render status
+			brain.screen.set_cursor(2, 1)
+			if routes_count:
+				brain.screen.print(f"Route {START_PATH_INDEX+1}/{routes_count}   ")
+			else:
+				brain.screen.print("Route (none)        ")
+			brain.screen.new_line()
+			# Odometry is always enabled in this simplified selector
+			brain.screen.print("Odometry: ON   ")
+			brain.screen.new_line()
+			brain.screen.print("A=Auton  B=Driver")
+
+			# Controller inputs
+			if controller.buttonLeft.pressing():
+				# decrements route index
+				if routes_count:
+					START_PATH_INDEX = max(0, (START_PATH_INDEX - 1) % routes_count)
+					wait(200, MSEC)
+			elif controller.buttonRight.pressing():
+				if routes_count:
+					START_PATH_INDEX = (START_PATH_INDEX + 1) % routes_count
+					wait(200, MSEC)
+			# Note: Odometry toggle removed - odometry is enforced ON by default
+			elif controller.buttonA.pressing():
+				# Start autonomous
+				brain.screen.clear_screen()
+				brain.screen.print("Auton Selected")
+				wait(200, MSEC)
+				return "auton"
+			elif controller.buttonB.pressing():
+				# Start driver
+				brain.screen.clear_screen()
+				brain.screen.print("Driver Selected")
+				wait(200, MSEC)
+				return "driver"
+
+			# Timeout handling
+			if timeout_s is not None and start_t.time(SEC) >= timeout_s:
+				brain.screen.clear_screen()
+				brain.screen.print("No selection: Driver")
+				wait(200, MSEC)
+				return "driver"
+
+			wait(20, MSEC)
+
+	# Use selector when running standalone
+	selection = program_selector(timeout_s=20.0)
+	if selection == "auton":
+		autonomous()
+	else:
+		driver_control()
 
         
